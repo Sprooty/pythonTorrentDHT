@@ -1,0 +1,4 @@
+datrie >= 0.7
+netaddr >= 0.7.12
+pytest >= 7.0
+pytest-cov >= 4.0

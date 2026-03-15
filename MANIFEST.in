@@ -1,0 +1,6 @@
+recursive-include btpydht *.py
+include setup.cfg
+include Makefile
+include LICENSE
+include README.md
+include requirements-dev.txt
