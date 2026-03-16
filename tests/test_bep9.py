@@ -18,15 +18,19 @@ from btpydht.metadata import (
     _build_handshake,
     _generate_peer_id,
     _parse_ext_handshake,
+    _parse_pex_message,
     _PROTOCOL_NAME,
     _PIECE_SIZE,
     _MSG_EXTENSION,
     _OUR_UT_METADATA_ID,
+    _OUR_UT_PEX_ID,
     _BEP9_REQUEST,
     _BEP9_DATA,
     _BEP9_REJECT,
     fetch_metadata,
     fetch_metadata_from_peers,
+    fetch_metadata_extended,
+    fetch_extended_from_peers,
 )
 
 
@@ -78,9 +82,21 @@ class TestBEP10Handshake:
             b"metadata_size": 32768,
             b"v": b"uTorrent 3.5",
         })
-        ut_id, meta_size = _parse_ext_handshake(payload)
-        assert ut_id == 2
-        assert meta_size == 32768
+        result = _parse_ext_handshake(payload)
+        assert result["ut_metadata_id"] == 2
+        assert result["metadata_size"] == 32768
+        assert result["ut_pex_id"] is None
+
+    def test_parse_ext_handshake_with_pex(self):
+        """Parse extension handshake with PEX support."""
+        payload = bencode({
+            b"m": {b"ut_metadata": 2, b"ut_pex": 3},
+            b"metadata_size": 16384,
+        })
+        result = _parse_ext_handshake(payload)
+        assert result["ut_metadata_id"] == 2
+        assert result["metadata_size"] == 16384
+        assert result["ut_pex_id"] == 3
 
     def test_parse_ext_handshake_no_ut_metadata(self):
         """Peer without ut_metadata support must raise ValueError."""
@@ -336,6 +352,150 @@ class TestBEP9MetadataFetch:
     def test_fetch_from_peers_all_fail(self):
         """All peers failing returns None."""
         result = fetch_metadata_from_peers(
+            b'\x00' * 20,
+            [("127.0.0.1", 1), ("127.0.0.1", 2)],
+            timeout=1.0,
+        )
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# BEP 11: PEX (Peer Exchange)
+# ---------------------------------------------------------------------------
+
+class TestPEXParsing:
+    """BEP 11: Parse PEX messages for seed/peer counts."""
+
+    def test_parse_pex_empty(self):
+        """Empty PEX message returns zero counts."""
+        payload = bencode({})
+        seeds, peers = _parse_pex_message(payload)
+        assert seeds == 0
+        assert peers == 0
+
+    def test_parse_pex_ipv4_peers(self):
+        """Count IPv4 peers from compact format (6 bytes each)."""
+        # 3 peers, each 6 bytes (4 IP + 2 port)
+        added = b'\x01\x02\x03\x04\x00\x50' * 3
+        payload = bencode({b"added": added})
+        seeds, peers = _parse_pex_message(payload)
+        assert peers == 3
+        assert seeds == 0
+
+    def test_parse_pex_ipv4_with_seeds(self):
+        """Identify seeds via the 0x02 flag bit."""
+        added = b'\x01\x02\x03\x04\x00\x50' * 3
+        # Peer 0: not a seed, Peer 1: seed (0x02), Peer 2: seed (0x02)
+        flags = bytes([0x00, 0x02, 0x02])
+        payload = bencode({b"added": added, b"added.f": flags})
+        seeds, peers = _parse_pex_message(payload)
+        assert peers == 3
+        assert seeds == 2
+
+    def test_parse_pex_ipv6_peers(self):
+        """Count IPv6 peers from compact format (18 bytes each)."""
+        added6 = b'\x00' * 18 * 2  # 2 IPv6 peers
+        payload = bencode({b"added6": added6})
+        seeds, peers = _parse_pex_message(payload)
+        assert peers == 2
+        assert seeds == 0
+
+    def test_parse_pex_mixed_v4_v6(self):
+        """Mixed IPv4 + IPv6 peers counted correctly."""
+        added = b'\x01\x02\x03\x04\x00\x50' * 2  # 2 IPv4
+        added6 = b'\x00' * 18 * 3  # 3 IPv6
+        flags = bytes([0x02, 0x00])  # 1 seed in IPv4
+        flags6 = bytes([0x02, 0x00, 0x02])  # 2 seeds in IPv6
+        payload = bencode({
+            b"added": added, b"added.f": flags,
+            b"added6": added6, b"added6.f": flags6,
+        })
+        seeds, peers = _parse_pex_message(payload)
+        assert peers == 5
+        assert seeds == 3
+
+
+# ---------------------------------------------------------------------------
+# Extended metadata fetch (metadata + PEX)
+# ---------------------------------------------------------------------------
+
+class TestExtendedFetch:
+    """fetch_metadata_extended returns metadata + PEX counts."""
+
+    def test_extended_fetch_returns_dict(self):
+        """Extended fetch returns dict with info, seed_count, peer_count."""
+        info = {
+            b"name": b"test_torrent",
+            b"piece length": 262144,
+            b"pieces": b'\x00' * 20,
+            b"length": 1024,
+        }
+        metadata = bencode(info)
+        info_hash = hashlib.sha1(metadata).digest()
+
+        # Reuse mock peer (no PEX, but should still return counts of 0)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(10)
+        _, port = server.getsockname()
+        t = threading.Thread(
+            target=_mock_peer,
+            args=(server, info_hash, metadata),
+            daemon=True,
+        )
+        t.start()
+
+        result = fetch_metadata_extended(
+            info_hash, "127.0.0.1", port, timeout=5.0, pex_wait=0.5
+        )
+        t.join(timeout=5)
+        server.close()
+
+        assert result is not None
+        assert result["info"][b"name"] == b"test_torrent"
+        assert isinstance(result["seed_count"], int)
+        assert isinstance(result["peer_count"], int)
+
+    def test_extended_from_peers_tries_multiple(self):
+        """fetch_extended_from_peers tries peers in order."""
+        info = {
+            b"name": b"test_torrent",
+            b"piece length": 262144,
+            b"pieces": b'\x00' * 20,
+            b"length": 1024,
+        }
+        metadata = bencode(info)
+        info_hash = hashlib.sha1(metadata).digest()
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(10)
+        _, port = server.getsockname()
+        t = threading.Thread(
+            target=_mock_peer,
+            args=(server, info_hash, metadata),
+            daemon=True,
+        )
+        t.start()
+
+        peers = [
+            ("127.0.0.1", 1),  # will fail
+            ("127.0.0.1", port),  # will succeed
+        ]
+        result = fetch_extended_from_peers(info_hash, peers, timeout=3.0)
+        t.join(timeout=5)
+        server.close()
+
+        assert result is not None
+        assert result["info"][b"name"] == b"test_torrent"
+
+    def test_extended_from_peers_all_fail(self):
+        """All peers failing returns None."""
+        result = fetch_extended_from_peers(
             b'\x00' * 20,
             [("127.0.0.1", 1), ("127.0.0.1", 2)],
             timeout=1.0,

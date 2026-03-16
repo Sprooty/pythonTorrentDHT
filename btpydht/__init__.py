@@ -13,3 +13,10 @@
 from btpydht.dht import DHT, DHT_BASE, Node, Bucket, RoutingTable
 from btpydht.utils import ID
 from btpydht.exceptions import NotFound, BucketFull, NoTokenError
+from btpydht.metadata import (
+    fetch_metadata,
+    fetch_metadata_from_peers,
+    fetch_metadata_extended,
+    fetch_extended_from_peers,
+)
+
